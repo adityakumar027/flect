@@ -1,7 +1,10 @@
+//go:build !windows
+
 package main
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,22 +14,16 @@ import (
 	"time"
 )
 
-type ProcessHandle struct {
-	Cmd     *exec.Cmd
-	Service string
-	Port    int
-	Started time.Time
-}
-
-func startProcess(proj string, name string, svc Service) (*ProcessHandle, error) {
+func startProcess(proj string, name string, svc Service, replicaI int, extraEnv []string) (*ProcessHandle, error) {
 	logPath := logPath(proj, name)
 	logFile, err := os.OpenFile(logPath,
 		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("opening log file: %w", err)
 	}
-	logFile.WriteString(fmt.Sprintf("\n=== %s starting at %s ===\n",
-		name, time.Now().Format(time.RFC3339)))
+	ts := fmt.Sprintf("\n=== %s[%d] starting at %s ===\n",
+		name, replicaI, time.Now().Format(time.RFC3339))
+	logFile.WriteString(ts)
 	logFile.Close()
 
 	workdir := proj
@@ -45,39 +42,56 @@ func startProcess(proj string, name string, svc Service) (*ProcessHandle, error)
 
 	cmd := exec.Command(cmdName, cmdArgs...)
 	cmd.Dir = workdir
-	cmd.SysProcAttr = sysProcAttr()
+
+	attr := &syscall.SysProcAttr{Setpgid: true}
+	if err := applyPlatformSecurity(attr, svc); err != nil {
+		return nil, fmt.Errorf("security setup: %w", err)
+	}
+	cmd.SysProcAttr = attr
 
 	logWriter, err := os.OpenFile(logPath,
 		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("opening log for writing: %w", err)
 	}
-
 	cmd.Stdout = logWriter
 	cmd.Stderr = logWriter
-	cmd.Env = os.Environ()
 
+	port := svc.Port
+	if port > 0 {
+		port = port + replicaI
+	}
+
+	cmd.Env = os.Environ()
 	for k, v := range svc.Env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
+	cmd.Env = append(cmd.Env,
+		fmt.Sprintf("FLECT_PROJECT=%s", proj),
+		fmt.Sprintf("FLECT_SERVICE=%s", name),
+		fmt.Sprintf("FLECT_REPLICA=%d", replicaI),
+	)
+	cmd.Env = append(cmd.Env, extraEnv...)
 
-	if svc.Port > 0 {
+	if port > 0 {
 		cmd.Env = append(cmd.Env,
-			fmt.Sprintf("PORT=%d", svc.Port),
-			fmt.Sprintf("FLECT_%s_PORT=%d", strings.ToUpper(name), svc.Port),
+			fmt.Sprintf("PORT=%d", port),
+			fmt.Sprintf("FLECT_%s_PORT=%d",
+				strings.ToUpper(strings.ReplaceAll(name, "-", "_")), port),
 		)
 	}
 
 	if err := cmd.Start(); err != nil {
 		logWriter.Close()
-		return nil, fmt.Errorf("starting %s: %w", name, err)
+		return nil, fmt.Errorf("starting %s[%d]: %w", name, replicaI, err)
 	}
 
 	return &ProcessHandle{
-		Cmd:     cmd,
-		Service: name,
-		Port:    svc.Port,
-		Started: time.Now(),
+		Cmd:      cmd,
+		Service:  name,
+		ReplicaI: replicaI,
+		Port:     port,
+		Started:  time.Now(),
 	}, nil
 }
 
@@ -85,18 +99,14 @@ func stopProcess(handle *ProcessHandle, signal string) error {
 	if handle == nil || handle.Cmd == nil || handle.Cmd.Process == nil {
 		return nil
 	}
-
 	sig := parseSignal(signal)
 	pgid, err := syscall.Getpgid(handle.Cmd.Process.Pid)
 	if err == nil && pgid > 0 {
-		// Send signal to entire process group
 		procGroup, _ := os.FindProcess(-pgid)
 		if procGroup != nil {
-			procGroup.Signal(sig)
-			return nil
+			return procGroup.Signal(sig)
 		}
 	}
-
 	return handle.Cmd.Process.Signal(sig)
 }
 
@@ -105,7 +115,6 @@ func waitProcess(handle *ProcessHandle, timeout time.Duration) error {
 	go func() {
 		done <- handle.Cmd.Wait()
 	}()
-
 	select {
 	case err := <-done:
 		return err
@@ -115,14 +124,37 @@ func waitProcess(handle *ProcessHandle, timeout time.Duration) error {
 	}
 }
 
+func processExited(handle *ProcessHandle) bool {
+	if handle == nil || handle.Cmd == nil || handle.Cmd.Process == nil {
+		return true
+	}
+	return handle.Cmd.Process.Signal(syscall.Signal(0)) != nil
+}
+
 func portInUse(port int) bool {
 	if port <= 0 {
 		return false
 	}
-	check := exec.Command("sh", "-c",
-		fmt.Sprintf("fuser %d/tcp 2>/dev/null || ss -tlnp 2>/dev/null | grep -q ':%d ' || netstat -tlnp 2>/dev/null | grep -q ':%d '",
-			port, port, port))
-	return check.Run() == nil
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 2*time.Second)
+	if err == nil {
+		conn.Close()
+		return true
+	}
+	return false
+}
+
+func waitForPort(port int, timeout time.Duration) bool {
+	if port <= 0 {
+		return true
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if portInUse(port) {
+			return true
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	return false
 }
 
 func findExecutable(name string) bool {
@@ -151,12 +183,10 @@ func checkRequiredExecutables(cfg *Config) []string {
 }
 
 func splitCommand(cmd string) []string {
-	// Simple shell-like splitting. Handles quoted args.
 	var parts []string
 	var cur strings.Builder
 	inQuote := false
 	quoteChar := byte(0)
-
 	for i := 0; i < len(cmd); i++ {
 		c := cmd[i]
 		if inQuote {
@@ -200,35 +230,17 @@ func parseSignal(s string) os.Signal {
 	}
 }
 
+func pidStr(h *ProcessHandle) string {
+	if h == nil || h.Cmd == nil || h.Cmd.Process == nil {
+		return "stopped"
+	}
+	return strconv.Itoa(h.Cmd.Process.Pid)
+}
+
 func init() {
-	// Ensure common unix defaults
 	if _, err := exec.LookPath("sh"); err != nil {
-		// On Windows, commands may need comspec
 		if comspec := os.Getenv("COMSPEC"); comspec != "" {
 			os.Setenv("SHELL", comspec)
 		}
 	}
-}
-
-// sysProcAttr returns platform-specific process attributes
-// This is the unix implementation; Windows is in exec_windows.go
-func sysProcAttr() *syscall.SysProcAttr {
-	return &syscall.SysProcAttr{
-		Setpgid: true,
-	}
-}
-
-func formatPID(pid int) string {
-	if pid <= 0 {
-		return "stopped"
-	}
-	return strconv.Itoa(pid)
-}
-
-func processExited(handle *ProcessHandle) bool {
-	if handle == nil || handle.Cmd == nil || handle.Cmd.Process == nil {
-		return true
-	}
-	err := handle.Cmd.Process.Signal(syscall.Signal(0))
-	return err != nil
 }

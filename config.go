@@ -13,17 +13,40 @@ type Config struct {
 	Services map[string]Service `json:"services"`
 }
 
+type HealthCheck struct {
+	Method   string `json:"method"`
+	Path     string `json:"path,omitempty"`
+	Port     int    `json:"port,omitempty"`
+	Command  string `json:"command,omitempty"`
+	Interval int    `json:"interval,omitempty"`
+	Timeout  int    `json:"timeout,omitempty"`
+	Retries  int    `json:"retries,omitempty"`
+}
+
+type Resources struct {
+	CPU    string `json:"cpu,omitempty"`
+	Memory string `json:"memory,omitempty"`
+}
+
 type Service struct {
-	Command     string   `json:"command"`
-	Args        []string `json:"args"`
-	Workdir     string   `json:"workdir,omitempty"`
-	Port        int      `json:"port,omitempty"`
-	DependsOn   []string `json:"depends_on,omitempty"`
-	Env         map[string]string `json:"env,omitempty"`
-	DataDirs    []string `json:"data_dirs,omitempty"`
-	HealthCmd   string   `json:"health_cmd,omitempty"`
-	HealthPort  int      `json:"health_port,omitempty"`
-	StopSignal  string   `json:"stop_signal,omitempty"`
+	Command      string            `json:"command"`
+	Args         []string          `json:"args"`
+	Workdir      string            `json:"workdir,omitempty"`
+	Port         int               `json:"port,omitempty"`
+	DependsOn    []string          `json:"depends_on,omitempty"`
+	Env          map[string]string `json:"env,omitempty"`
+	DataDirs     []string          `json:"data_dirs,omitempty"`
+	StopSignal   string            `json:"stop_signal,omitempty"`
+	User         string            `json:"user,omitempty"`
+	Capabilities []string          `json:"capabilities,omitempty"`
+	ReadonlyRoot bool              `json:"readonly_root,omitempty"`
+	AllowedPaths []string          `json:"allowed_paths,omitempty"`
+	Resources    *Resources        `json:"resources,omitempty"`
+	Replicas     int               `json:"replicas,omitempty"`
+	Restart      string            `json:"restart,omitempty"`
+	HealthCheck  *HealthCheck      `json:"health_check,omitempty"`
+	HealthCmd    string            `json:"health_cmd,omitempty"`
+	HealthPort   int               `json:"health_port,omitempty"`
 }
 
 type State struct {
@@ -31,10 +54,12 @@ type State struct {
 }
 
 type ServiceState struct {
-	PID     int    `json:"pid,omitempty"`
-	Running bool   `json:"running"`
-	Port    int    `json:"port,omitempty"`
-	Started string `json:"started,omitempty"`
+	PID       int               `json:"pid,omitempty"`
+	Running   bool              `json:"running"`
+	Port      int               `json:"port,omitempty"`
+	Started   string            `json:"started,omitempty"`
+	Replicas  int               `json:"replicas,omitempty"`
+	Instances map[string]int    `json:"instances,omitempty"`
 }
 
 func configPath(proj string) string {
@@ -55,13 +80,52 @@ func loadConfig(proj string) (*Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parsing config: %w", err)
 	}
-	if cfg.Version == "" {
-		cfg.Version = "1"
-	}
+	migrateConfig(&cfg)
 	if cfg.Services == nil {
 		cfg.Services = make(map[string]Service)
 	}
+	for name, svc := range cfg.Services {
+		if svc.Replicas < 1 {
+			svc.Replicas = 1
+		}
+		if svc.Restart == "" {
+			svc.Restart = "on-failure"
+		}
+		if svc.Env == nil {
+			svc.Env = make(map[string]string)
+		}
+		cfg.Services[name] = svc
+	}
 	return &cfg, nil
+}
+
+func migrateConfig(cfg *Config) {
+	if cfg.Version == "" || cfg.Version == "1" {
+		for name, svc := range cfg.Services {
+			if svc.HealthCmd != "" || svc.HealthPort != 0 {
+				svc.HealthCheck = &HealthCheck{}
+				if svc.HealthCmd != "" {
+					svc.HealthCheck.Method = "exec"
+					svc.HealthCheck.Command = svc.HealthCmd
+				} else {
+					svc.HealthCheck.Method = "tcp_connect"
+					svc.HealthCheck.Port = svc.HealthPort
+				}
+				svc.HealthCmd = ""
+				svc.HealthPort = 0
+			}
+			cfg.Services[name] = svc
+		}
+		cfg.Version = "2"
+	}
+}
+
+func saveConfig(proj string, cfg *Config) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encoding config: %w", err)
+	}
+	return os.WriteFile(configPath(proj), data, 0644)
 }
 
 func validateConfig(cfg *Config) error {
@@ -80,11 +144,10 @@ func validateConfig(cfg *Config) error {
 			}
 		}
 	}
-	order, err := topologicalSort(cfg.Services)
+	_, err := topologicalSort(cfg.Services)
 	if err != nil {
 		return fmt.Errorf("dependency cycle: %w", err)
 	}
-	_ = order // used during start
 	return nil
 }
 

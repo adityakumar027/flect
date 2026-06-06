@@ -7,23 +7,22 @@ import (
 )
 
 func runInit(proj string, args []string) {
-	// Check if already initialized
 	if isFlectProject(proj) {
-		fmt.Println("flect: already initialized in", proj)
+		fmt.Println(warnMsg("already initialized in %s", proj))
 		return
 	}
 
-	// Check for existing config
 	cfgPath := filepath.Join(proj, "flect.json")
 	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
-		// Create a default config
 		defaultCfg := `{
-  "version": "1",
+  "version": "2",
   "project": "my-project",
   "services": {
     "app": {
       "command": "node index.js",
       "port": 3000,
+      "replicas": 1,
+      "restart": "on-failure",
       "env": {
         "NODE_ENV": "development"
       }
@@ -31,30 +30,34 @@ func runInit(proj string, args []string) {
   }
 }`
 		if err := os.WriteFile(cfgPath, []byte(defaultCfg), 0644); err != nil {
-			fmt.Fprintf(os.Stderr, "flect: error creating config: %v\n", err)
+			fmt.Fprintf(os.Stderr, "%s %v\n", fail("error creating config:"), err)
 			os.Exit(1)
 		}
-		fmt.Println("flect: created flect.json (edit to configure your services)")
+		fmt.Println(success("created flect.json — edit to configure your services"))
 	}
 
-	// Create .flect directory
 	if err := createStateDir(proj); err != nil {
-		fmt.Fprintf(os.Stderr, "flect: error creating state directory: %v\n", err)
+		fmt.Fprintf(os.Stderr, "%s %v\n", fail("error creating state directory:"), err)
 		os.Exit(1)
 	}
 
-	fmt.Println("flect: initialized in", proj)
+	fmt.Println(success("project initialized in %s", proj))
 
-	// Load and validate config
 	if cfg, err := loadConfig(proj); err == nil {
+		hadWarnings := false
 		if missing := checkRequiredExecutables(cfg); len(missing) > 0 {
-			fmt.Println("flect: warning — required executables not found:")
+			fmt.Println(warnMsg("required executables not found:"))
 			for _, m := range missing {
-				fmt.Printf("  - %s\n", m)
+				fmt.Printf("  %s %s\n", yellow(warn), yellow(m))
 			}
+			hadWarnings = true
 		}
 		if err := validateConfig(cfg); err != nil {
-			fmt.Fprintf(os.Stderr, "flect: config warning: %v\n", err)
+			fmt.Println(warnMsg("config warning: %v", err))
+			hadWarnings = true
+		}
+		if !hadWarnings {
+			fmt.Println(green(check) + " config validated successfully")
 		}
 	}
 }

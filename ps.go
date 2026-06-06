@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -11,36 +12,93 @@ import (
 func runPs(proj string) {
 	st, err := loadState(proj)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "flect: %v\n", err)
+		fmt.Fprintf(os.Stderr, "%s %v\n", fail("loading state:"), err)
 		os.Exit(1)
 	}
 
 	cfg, err := loadConfig(proj)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "flect: %v\n", err)
+		fmt.Fprintf(os.Stderr, "%s %v\n", fail("loading config:"), err)
 		os.Exit(1)
 	}
 
 	if len(st.Services) == 0 {
-		fmt.Println("flect: no services")
+		fmt.Println(warnMsg("no services"))
 		return
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(w, "SERVICE\tSTATUS\tPID\tPORT\tUPTIME")
+	fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+		bold("SERVICE"), bold("STATUS"), bold("REPLICAS"),
+		bold("PORTS"), bold("PID"), bold("UPTIME"))
+	fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+		"-------", "------", "--------",
+		"-----", "---", "------")
 
-	for _, name := range sortedKeys(st.Services) {
-		s := st.Services[name]
+	handles := snapshotProcesses()
+
+	names := make([]string, 0, len(cfg.Services))
+	for name := range cfg.Services {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
 		svc := cfg.Services[name]
+		s := st.Services[name]
+		instances := handles[name]
 
-		status := "stopped"
-		pid := "-"
-		port := "-"
+		status := red("stopped")
+		replicas := fmt.Sprintf("0/%d", svc.Replicas)
+		ports := "-"
+		pidStr := "-"
 		uptime := "-"
 
-		if s.Running {
-			status = "running"
-			pid = formatPID(s.PID)
+		if len(instances) > 0 {
+			running := 0
+			var portStrs []string
+			var pidStrs []string
+			var started time.Time
+			hasStart := false
+
+			for _, h := range instances {
+				if h.Cmd != nil && h.Cmd.Process != nil && !processExited(h) {
+					running++
+					if h.Port > 0 {
+						portStrs = append(portStrs, fmt.Sprintf("%d", h.Port))
+					}
+					pidStrs = append(pidStrs, fmt.Sprintf("%d", h.Cmd.Process.Pid))
+					if !hasStart || h.Started.Before(started) {
+						started = h.Started
+						hasStart = true
+					}
+				}
+			}
+
+			replicas = fmt.Sprintf("%d/%d", running, svc.Replicas)
+			if running > 0 {
+				status = green("running")
+			}
+			if len(portStrs) > 0 {
+				ports = strings.Join(portStrs, ",")
+			}
+			if len(pidStrs) > 0 {
+				pidStr = strings.Join(pidStrs, ",")
+			}
+			if hasStart {
+				uptime = formatDuration(time.Since(started))
+			}
+		} else if s.Running {
+			count := len(s.Instances)
+			if count < 1 {
+				count = 1
+			}
+			replicas = fmt.Sprintf("%d/%d", count, svc.Replicas)
+			status = green("running")
+			if svc.Port > 0 {
+				ports = fmt.Sprintf("%d", svc.Port)
+			}
+			pidStr = fmt.Sprintf("%d", s.PID)
 			if s.Started != "" {
 				t, err := time.Parse(time.RFC3339, s.Started)
 				if err == nil {
@@ -48,11 +106,9 @@ func runPs(proj string) {
 				}
 			}
 		}
-		if svc.Port > 0 {
-			port = fmt.Sprintf("%d", svc.Port)
-		}
 
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", name, status, pid, port, uptime)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			cyanBold(name), status, replicas, ports, pidStr, uptime)
 	}
 	w.Flush()
 }
@@ -60,26 +116,43 @@ func runPs(proj string) {
 func runStatus(proj string) {
 	st, err := loadState(proj)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "flect: %v\n", err)
+		fmt.Fprintf(os.Stderr, "%s %v\n", fail("loading state:"), err)
 		os.Exit(1)
 	}
 
 	cfg, err := loadConfig(proj)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "flect: %v\n", err)
+		fmt.Fprintf(os.Stderr, "%s %v\n", fail("loading config:"), err)
 		os.Exit(1)
 	}
 
 	running := 0
-	total := len(cfg.Services)
-	for _, s := range st.Services {
+	total := 0
+	targetReplicas := 0
+	for name, svc := range cfg.Services {
+		total++
+		targetReplicas += svc.Replicas
+		s := st.Services[name]
 		if s.Running {
 			running++
 		}
 	}
 
-	fmt.Printf("flect: project '%s' — %d/%d services running\n",
-		cfg.Project, running, total)
+	projectName := cfg.Project
+	if projectName == "" {
+		projectName = "unnamed"
+	}
+
+	statusIcon := green(check)
+	if running < total {
+		statusIcon = yellow(warn)
+	}
+
+	actualInstances := countRunningInstances(st)
+
+	fmt.Printf("  %s project %s — %d/%d services (%d/%d instances)\n",
+		statusIcon, cyanBold(projectName), running, total,
+		actualInstances, targetReplicas)
 
 	if running > 0 {
 		fmt.Println()
@@ -87,19 +160,53 @@ func runStatus(proj string) {
 	}
 }
 
+func countRunningInstances(st *State) int {
+	count := 0
+	for _, s := range st.Services {
+		if s.Running {
+			if len(s.Instances) > 0 {
+				count += len(s.Instances)
+			} else {
+				count++
+			}
+		}
+	}
+	return count
+}
+
 func runLogs(proj string, args []string) {
+	tailMode := false
+	followMode := false
 	serviceFilter := ""
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		serviceFilter = args[0]
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--tail", "-t":
+			tailMode = true
+		case "--follow", "-f":
+			followMode = true
+		case "--help":
+			fmt.Println(`flect logs [options] [service]
+
+Options:
+  --tail, -t      Show only the last 50 lines
+  --follow, -f    Follow log output (like tail -f)
+  --help          Show this help`)
+			return
+		default:
+			if !strings.HasPrefix(args[i], "-") {
+				serviceFilter = args[i]
+			}
+		}
 	}
 
 	entries, err := os.ReadDir(logsDir(proj))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "flect: no logs available: %v\n", err)
+		fmt.Fprintf(os.Stderr, "%s %v\n", fail("reading logs:"), err)
 		os.Exit(1)
 	}
 
-	found := false
+	names := make([]string, 0)
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".log") {
 			continue
@@ -108,33 +215,75 @@ func runLogs(proj string, args []string) {
 		if serviceFilter != "" && name != serviceFilter {
 			continue
 		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
 
-		found = true
-		data, err := os.ReadFile(logPath(proj, name))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "flect: error reading %s log: %v\n", name, err)
-			continue
+	if len(names) == 0 {
+		if serviceFilter != "" {
+			fmt.Println(warnMsg("no logs for %q", serviceFilter))
+		} else {
+			fmt.Println(warnMsg("no logs available"))
 		}
-
-		fmt.Printf("=== %s ===\n", name)
-		fmt.Println(string(data))
+		return
 	}
 
-	if !found {
-		if serviceFilter != "" {
-			fmt.Printf("flect: no logs for '%s'\n", serviceFilter)
+	for _, name := range names {
+		if !followMode {
+			data, err := os.ReadFile(logPath(proj, name))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%s reading %s: %v\n",
+					fail(""), name, err)
+				continue
+			}
+			content := string(data)
+			if tailMode {
+				lines := strings.Split(content, "\n")
+				if len(lines) > 50 {
+					lines = lines[len(lines)-50:]
+				}
+				content = strings.Join(lines, "\n")
+			}
+			if len(names) > 1 {
+				fmt.Printf("=== %s ===\n", name)
+			}
+			fmt.Print(content)
+			if !strings.HasSuffix(content, "\n") {
+				fmt.Println()
+			}
 		} else {
-			fmt.Println("flect: no logs available")
+			followLog(proj, name)
+		}
+	}
+}
+
+func followLog(proj, name string) {
+	f, err := os.Open(logPath(proj, name))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s %v\n", fail("following log:"), err)
+		return
+	}
+	defer f.Close()
+
+	buf := make([]byte, 4096)
+	for {
+		n, err := f.Read(buf)
+		if n > 0 {
+			fmt.Print(string(buf[:n]))
+		}
+		if err != nil {
+			time.Sleep(500 * time.Millisecond)
 		}
 	}
 }
 
 func runClean(proj string) {
-	fmt.Print("flect: remove .flect directory? This will delete all data and logs. [y/N] ")
+	fmt.Printf("  %s remove .flect directory? This will delete all data and logs. [y/N] ",
+		yellow(warn))
 	var response string
 	fmt.Scanln(&response)
 	if response != "y" && response != "Y" {
-		fmt.Println("flect: cancelled")
+		fmt.Println(warnMsg("cancelled"))
 		return
 	}
 
@@ -148,30 +297,20 @@ func runClean(proj string) {
 				}
 			}
 		}
-	}
-
-	if err := os.RemoveAll(flectDir(proj)); err != nil {
-		fmt.Fprintf(os.Stderr, "flect: clean error: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Println("flect: .flect directory removed")
-}
-
-func sortedKeys(m map[string]ServiceState) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	// Simple sort (will be alphabetical)
-	for i := 0; i < len(keys); i++ {
-		for j := i + 1; j < len(keys); j++ {
-			if keys[i] > keys[j] {
-				keys[i], keys[j] = keys[j], keys[i]
+		handles := snapshotProcesses()
+		for _, instances := range handles {
+			for _, h := range instances {
+				stopProcess(h, "SIGKILL")
 			}
 		}
 	}
-	return keys
+
+	if err := os.RemoveAll(flectDir(proj)); err != nil {
+		fmt.Fprintf(os.Stderr, "%s %v\n", fail("clean error:"), err)
+		os.Exit(1)
+	}
+
+	fmt.Println(success(".flect directory removed"))
 }
 
 func formatDuration(d time.Duration) string {
@@ -179,12 +318,19 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%ds", int(d.Seconds()))
 	}
 	if d < time.Hour {
-		return fmt.Sprintf("%dm", int(d.Minutes()))
+		m := int(d.Minutes())
+		s := int(d.Seconds()) % 60
+		return fmt.Sprintf("%dm%ds", m, s)
 	}
 	if d < 24*time.Hour {
 		h := int(d.Hours())
 		m := int(d.Minutes()) % 60
 		return fmt.Sprintf("%dh%dm", h, m)
 	}
-	return fmt.Sprintf("%dd", int(d.Hours()/24))
+	days := int(d.Hours() / 24)
+	h := int(d.Hours()) % 24
+	if h > 0 {
+		return fmt.Sprintf("%dd%dh", days, h)
+	}
+	return fmt.Sprintf("%dd", days)
 }
