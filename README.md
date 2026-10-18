@@ -23,7 +23,7 @@ compiled binary that runs anywhere go compiles to.
 you declare what services your project needs in `flect.json`. flect
 starts them in the right order, checks they are healthy, restarts them
 if they crash, and shuts them down gracefully. all data lives in
-`.flect/` inside your project — you can stop, restart, and clean
+`.flect/` inside your project - you can stop, restart, and clean
 without losing state.
 
 no daemon. no root. no containers. no vm. one file.
@@ -131,9 +131,9 @@ all instances.
 
 ### restart policies
 
-- `"always"` — restart on any exit
-- `"on-failure"` — restart only on non-zero exit code
-- `"never"` — do not restart
+- `"always"` - restart on any exit
+- `"on-failure"` - restart only on non-zero exit code
+- `"never"` - do not restart
 
 restart includes exponential backoff (1s, 2s, 4s, 8s, max 30s) to
 avoid restart storms.
@@ -174,8 +174,8 @@ they are advisory.
 
 linux security features when available:
 
-- `PR_SET_NO_NEW_PRIVS` — prevent privilege escalation via setuid
-- `PR_SET_PDEATHSIG` — child dies if parent dies
+- `PR_SET_NO_NEW_PRIVS` - prevent privilege escalation via setuid
+- `PR_SET_PDEATHSIG` - child dies if parent dies
 - setrlimit for cpu and memory caps
 - read-only root option via chroot
 - user switching via `User` field in config
@@ -305,8 +305,8 @@ ptrace. it uses what every operating system already provides:
 - **resource limits**: setrlimit on linux
 
 the isolation is environmental, not kernel-level. flect gives each
-service a consistent view of the world — its own working directory,
-its own environment variables, its own log stream — without lying
+service a consistent view of the world - its own working directory,
+its own environment variables, its own log stream - without lying
 about the filesystem or network.
 
 this design is intentional. kernel-level isolation (containers) is
@@ -371,3 +371,8 @@ GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o flect.exe .
 ## license
 
 mit
+
+
+## Notes for this checkout
+
+This checkout is available at `adityakumar027/flect`. Existing upstream URLs remain for attribution. This is a local Go process supervisor, not a hosted web application. Do not assume process supervision provides container isolation or a production security boundary.
